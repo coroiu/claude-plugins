@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""confluence-edit: minimal Confluence ADF editing helper.
+
+Edits pages in place without round-tripping through markdown — preserves
+inline-comment anchors, layouts, and other ADF features that markdown drops.
+
+Auth via env vars:
+  CONFLUENCE_EMAIL        Atlassian account email
+  CONFLUENCE_API_TOKEN    API token (https://id.atlassian.com/manage-profile/security/api-tokens)
+  CONFLUENCE_BASE_URL     e.g. https://bitwarden.atlassian.net
+
+Commands:
+  fetch <page-id> [-o FILE]
+        Download the page body as ADF JSON (plus metadata).
+
+  push <page-id> <file> [-m MESSAGE]
+        Upload a modified ADF body. Auto-increments version.
+        The file should be the output of `fetch` with edits applied.
+
+  replace-text <page-id> <old> <new> [--dry-run] [-m MESSAGE]
+        Replace every occurrence of <old> with <new> across all text nodes,
+        preserving marks (including inline-comment annotation marks).
+
+  apply-patch <page-id> <patch.py> [--dry-run] [-m MESSAGE]
+        Run a Python patch script. The script must define
+        `patch(body: dict) -> dict` that returns the modified body.
+
+  list-anchors <page-id>
+        List all inline-comment annotation marks in the page and the
+        text spans they cover. Useful to verify anchors before/after edits.
+
+Examples:
+  # Save current page to a file you can edit
+  confluence-edit fetch 2923724969 -o page.json
+
+  # Push a modified file back
+  confluence-edit push 2923724969 page.json -m "fix typo in Task 3"
+
+  # Inline replacement, preserves anchors
+  confluence-edit replace-text 2923724969 'to_rfc3339()' 'to_rfc3339_opts(SecondsFormat::Millis, true)'
+
+  # Custom transform via a patch script
+  confluence-edit apply-patch 2923724969 patch.py --dry-run
+"""
+
+import argparse
+import base64
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+def _config():
+    email = os.environ.get("CONFLUENCE_EMAIL")
+    token = os.environ.get("CONFLUENCE_API_TOKEN")
+    base = os.environ.get("CONFLUENCE_BASE_URL")
+    missing = [
+        k
+        for k, v in {
+            "CONFLUENCE_EMAIL": email,
+            "CONFLUENCE_API_TOKEN": token,
+            "CONFLUENCE_BASE_URL": base,
+        }.items()
+        if not v
+    ]
+    if missing:
+        sys.exit(
+            f"error: missing env vars: {', '.join(missing)}\n"
+            "Generate an API token at https://id.atlassian.com/manage-profile/security/api-tokens"
+        )
+    return email, token, base.rstrip("/")
+
+
+def _api(method, path, body=None):
+    email, token, base = _config()
+    auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+    req = urllib.request.Request(
+        f"{base}{path}",
+        method=method,
+        headers={
+            "Authorization": f"Basic {auth}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps(body).encode() if body is not None else None,
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        sys.exit(f"HTTP {e.code} on {method} {path}:\n{e.read().decode()}")
+
+
+def get_page(page_id):
+    return _api(
+        "GET", f"/wiki/api/v2/pages/{page_id}?body-format=atlas_doc_format"
+    )
+
+
+def put_page(page_id, page, body, message):
+    payload = {
+        "id": page_id,
+        "status": "current",
+        "title": page["title"],
+        "body": {
+            "representation": "atlas_doc_format",
+            "value": json.dumps(body),
+        },
+        "version": {
+            "number": page["version"]["number"] + 1,
+            "message": message or "",
+        },
+    }
+    return _api("PUT", f"/wiki/api/v2/pages/{page_id}", payload)
+
+
+def walk_text_nodes(node):
+    if isinstance(node, dict):
+        if node.get("type") == "text":
+            yield node
+        for c in node.get("content", []) or []:
+            yield from walk_text_nodes(c)
+    elif isinstance(node, list):
+        for c in node:
+            yield from walk_text_nodes(c)
+
+
+def cmd_fetch(args):
+    page = get_page(args.page_id)
+    body = json.loads(page["body"]["atlas_doc_format"]["value"])
+    out = {
+        "id": page["id"],
+        "title": page["title"],
+        "version": page["version"]["number"],
+        "spaceId": page["spaceId"],
+        "body": body,
+    }
+    text = json.dumps(out, indent=2)
+    if args.output:
+        Path(args.output).write_text(text)
+        print(f"wrote {args.output} (version {out['version']})", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+
+
+def cmd_push(args):
+    page = get_page(args.page_id)
+    raw = json.loads(Path(args.file).read_text())
+    body = raw.get("body", raw)  # accept either {body: ...} or just the body
+    result = put_page(args.page_id, page, body, args.message)
+    print(
+        f"pushed version {result['version']['number']}: "
+        f"{result['_links']['base']}{result['_links']['webui']}",
+        file=sys.stderr,
+    )
+
+
+def cmd_replace_text(args):
+    page = get_page(args.page_id)
+    body = json.loads(page["body"]["atlas_doc_format"]["value"])
+    count = 0
+    for node in walk_text_nodes(body):
+        if args.old in node["text"]:
+            node["text"] = node["text"].replace(args.old, args.new)
+            count += 1
+    print(f"replaced in {count} text node(s)", file=sys.stderr)
+    if count == 0 or args.dry_run:
+        return
+    msg = args.message or f"replace-text: {args.old!r} -> {args.new!r}"
+    result = put_page(args.page_id, page, body, msg)
+    print(f"pushed version {result['version']['number']}", file=sys.stderr)
+
+
+def cmd_apply_patch(args):
+    page = get_page(args.page_id)
+    body = json.loads(page["body"]["atlas_doc_format"]["value"])
+    namespace = {}
+    exec(compile(Path(args.patch).read_text(), args.patch, "exec"), namespace)
+    if "patch" not in namespace or not callable(namespace["patch"]):
+        sys.exit("patch script must define a function `patch(body) -> body`")
+    new_body = namespace["patch"](body)
+    if args.dry_run:
+        print(json.dumps(new_body, indent=2))
+        return
+    msg = args.message or f"apply-patch: {args.patch}"
+    result = put_page(args.page_id, page, new_body, msg)
+    print(f"pushed version {result['version']['number']}", file=sys.stderr)
+
+
+def cmd_list_anchors(args):
+    page = get_page(args.page_id)
+    body = json.loads(page["body"]["atlas_doc_format"]["value"])
+    spans = {}  # id -> list of text fragments
+    for node in walk_text_nodes(body):
+        for mark in node.get("marks", []) or []:
+            if mark.get("type") == "annotation":
+                aid = mark.get("attrs", {}).get("id")
+                spans.setdefault(aid, []).append(node["text"])
+    if not spans:
+        print("no inline-comment anchors found", file=sys.stderr)
+        return
+    for aid, fragments in spans.items():
+        print(f"{aid}:")
+        for f in fragments:
+            print(f"  {f!r}")
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Confluence ADF editing helper",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split("Commands:", 1)[1] if __doc__ else None,
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    f = sub.add_parser("fetch", help="download page ADF")
+    f.add_argument("page_id")
+    f.add_argument("-o", "--output")
+    f.set_defaults(func=cmd_fetch)
+
+    u = sub.add_parser("push", help="upload modified ADF")
+    u.add_argument("page_id")
+    u.add_argument("file")
+    u.add_argument("-m", "--message")
+    u.set_defaults(func=cmd_push)
+
+    r = sub.add_parser("replace-text", help="text find/replace, preserves marks")
+    r.add_argument("page_id")
+    r.add_argument("old")
+    r.add_argument("new")
+    r.add_argument("--dry-run", action="store_true")
+    r.add_argument("-m", "--message")
+    r.set_defaults(func=cmd_replace_text)
+
+    pp = sub.add_parser("apply-patch", help="apply a Python patch function")
+    pp.add_argument("page_id")
+    pp.add_argument("patch")
+    pp.add_argument("--dry-run", action="store_true")
+    pp.add_argument("-m", "--message")
+    pp.set_defaults(func=cmd_apply_patch)
+
+    la = sub.add_parser("list-anchors", help="show inline-comment anchors")
+    la.add_argument("page_id")
+    la.set_defaults(func=cmd_list_anchors)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

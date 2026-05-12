@@ -1,0 +1,17 @@
+{
+  "name": "coroiu",
+  "description": "Personal Claude Code plugin marketplace.",
+  "owner": {
+    "name": "Andreas Coroiu",
+    "email": "andreas@andreascoroiu.com"
+  },
+  "metadata": {
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "confluence-edit",
+      "description": "Edit Confluence pages in ADF without breaking inline-comment anchors that markdown round-trips drop."
+    }
+  ]
+}

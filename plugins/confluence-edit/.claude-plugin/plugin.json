@@ -1,0 +1,10 @@
+{
+  "name": "confluence-edit",
+  "description": "Edit Confluence pages in ADF without breaking inline-comment anchors that markdown round-trips drop.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Andreas Coroiu",
+    "email": "andreas@andreascoroiu.com"
+  },
+  "keywords": ["confluence", "atlassian", "adf", "inline-comments"]
+}
